@@ -1,0 +1,136 @@
+diff --git a/tboot-1.7.3/tboot/common/integrity.c b/tboot-1.7.3/tboot/common/integrity.c
+index 066ba19..c606101 100644
+--- a/tboot-1.7.3/tboot/common/integrity.c
++++ b/tboot-1.7.3/tboot/common/integrity.c
+@@ -48,7 +48,6 @@
+ #include <tb_error.h>
+ #include <vmac.h>
+ #include <integrity.h>
+-
+ #include <page.h>
+ #include <paging.h>
+ extern char _end[];
+@@ -78,17 +77,19 @@ extern void apply_policy(tb_error_t error);
+ 
+ #define EVTTYPE_TB_MEASUREMENT (0x400 + 0x101)
+ extern bool evtlog_append(uint8_t pcr, tb_hash_t *hash, uint32_t type);
++extern bool read_policy_from_tpm(tpm_nv_index_t index,
++                void* policy_index, size_t *policy_index_size);
++static void asset_tag(void);
+ 
+ typedef struct {
+     uint8_t mac_key[VMAC_KEY_LEN/8];
+     uint8_t shared_key[sizeof(_tboot_shared.s3_key)];
+ } sealed_secrets_t;
+ 
+-
+ static bool extend_pcrs(void)
+ {
+     tpm_pcr_value_t pcr17, pcr18;
+-
++    
+     tpm_pcr_read(2, 17, &pcr17);
+     tpm_pcr_read(2, 18, &pcr18);
+     printk(TBOOT_DETA"PCRs before extending:\n");
+@@ -111,10 +112,75 @@ static bool extend_pcrs(void)
+     printk(TBOOT_DETA"PCRs after extending:\n");
+     printk(TBOOT_DETA"  PCR 17: "); print_hash((tb_hash_t *)&pcr17, TB_HALG_SHA1);
+     printk(TBOOT_DETA"  PCR 18: "); print_hash((tb_hash_t *)&pcr18, TB_HALG_SHA1);
+-
++    asset_tag(); /*asset tag pcr-22 */
++   
+     return true;
+ }
+ 
++
++/* extend pcr-22 with asset tag
++ * flow:
++ *   read TPM nv index#5 
++ *   calculate sha1 hash
++ *   extend pcr-22 with the hash
++ */
++
++static void asset_tag(void)
++{
++    tpm_pcr_value_t pcr22;
++    unsigned char* asset_tag;
++    size_t asset_tag_size;
++    uint32_t ret, index_size;
++    tb_hash_t digest;
++
++    printk(TBOOT_DETA"reading Asset TAG from from TPM NV_Index %u...\n",
++            TPM_NV_INDEX_GEO);
++
++    ret = tpm_get_nvindex_size(0, TPM_NV_INDEX_GEO, &index_size);
++    if ( ret != TPM_SUCCESS ) {
++        printk(TBOOT_WARN"\t :failed to read asset-tag size from NV");
++        return;
++    }
++    asset_tag = (unsigned *)malloc(index_size);
++    if ( asset_tag == NULL ) {
++        printk(TBOOT_WARN"\t :failed to allocate asset_tag of size %u\n",index_size);
++        return ;
++    }
++    asset_tag_size = index_size;
++    /*fill buffer from NV */ 
++    if ( !read_policy_from_tpm(TPM_NV_INDEX_GEO,
++                asset_tag, &asset_tag_size) ) {
++        printk(TBOOT_DETA"\t :reading asset_tag failed from NV\n");
++        free(asset_tag);
++        return;
++    }
++    /*hash the buffer */
++    if ( !hash_buffer(asset_tag, asset_tag_size, &digest, TB_HALG_SHA1) ) {
++        printk(TBOOT_WARN"\t :asset_tag hash failed failed\n");
++        free(asset_tag);
++        return;
++    }
++    
++    tpm_pcr_read(2, 22, &pcr22);
++    printk(TBOOT_DETA"PCR22 before asset_tag extention:\n");
++    printk(TBOOT_DETA"  PCR 22: "); print_hash((tb_hash_t *)&pcr22, TB_HALG_SHA1);
++    printk(TBOOT_DETA"\t:%lu GEO NV bytes read\n", asset_tag_size);
++    memcpy((void*)(pcr22.digest), digest.sha1, SHA1_LENGTH); 
++    
++    /* extend pcr-22 */
++    if ( tpm_pcr_extend(2, 22, &pcr22, NULL) != TPM_SUCCESS ) {
++        printk(TBOOT_DETA"\t:assent_tag extend failed \n");       
++        free(asset_tag);
++        return;
++    }
++
++    tpm_pcr_read(2, 22, &pcr22);
++    printk(TBOOT_DETA"PCR22 after GEO-TAG extending:\n");
++    printk(TBOOT_DETA"  PCR 22: "); print_hash((tb_hash_t *)&pcr22, TB_HALG_SHA1);
++    free(asset_tag);
++    return; 
++}
++
+ static void print_pre_k_s3_state(void)
+ {
+     printk(TBOOT_DETA"pre_k_s3_state:\n");
+diff --git a/tboot-1.7.3/tboot/common/policy.c b/tboot-1.7.3/tboot/common/policy.c
+index e8a7704..c3463d3 100644
+--- a/tboot-1.7.3/tboot/common/policy.c
++++ b/tboot-1.7.3/tboot/common/policy.c
+@@ -184,7 +184,7 @@ static const tb_policy_t* g_policy = &_def_policy;
+  *
+  * policy_index_size is in/out
+  */
+-static bool read_policy_from_tpm(tpm_nv_index_t index,
++bool read_policy_from_tpm(tpm_nv_index_t index,
+                 void* policy_index, size_t *policy_index_size)
+ {
+ #define NV_READ_SEG_SIZE    256
+diff --git a/tboot-1.7.3/tboot/include/tpm.h b/tboot-1.7.3/tboot/include/tpm.h
+index 67b42d4..4e22df9 100644
+--- a/tboot-1.7.3/tboot/include/tpm.h
++++ b/tboot-1.7.3/tboot/include/tpm.h
+@@ -51,6 +51,7 @@
+ 
+ #define TPM_NR_LOCALITIES             5
+ 
++#define TPM_NV_INDEX_GEO              ((uint32_t)0x00000005)
+ /*
+  * return code:
+  * The TPM has five types of return code. One indicates successful operation
